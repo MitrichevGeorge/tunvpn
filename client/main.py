@@ -1,21 +1,17 @@
 import os
-import fcntl
-import struct
 import asyncio
 import websockets
-import subprocess
+from websockets.asyncio.client import ClientConnection
+from collections.abc import Buffer
+from core import create_tun, run_command
+from urllib.parse import urlparse
 
-TUNSETIFF = 0x400454ca
-IFF_TUN = 0x0001
-IFF_NO_PI = 0x1000
+TUN_IP = "10.0.0.2/24"
+TUN = "tun0"
+DEV = "eth0"
+URI = "wss://.....taildfcdfd.ts.net/...."
 
-def create_tun(name=b"tun0"):
-    tun = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
-    ifr = struct.pack("16sH", name, IFF_TUN | IFF_NO_PI)
-    fcntl.ioctl(tun, TUNSETIFF, ifr)
-    return tun
-
-async def tun_to_ws(websocket, tun_fd):
+async def tun_to_ws(websocket: ClientConnection, tun_fd: int):
     loop = asyncio.get_running_loop()
     while True:
         try:
@@ -32,11 +28,13 @@ async def tun_to_ws(websocket, tun_fd):
             print(f"Ошибка чтения из TUN клиента: {e}")
             break
 
-async def ws_to_tun(websocket, tun_fd):
+async def ws_to_tun(websocket: ClientConnection, tun_fd: int):
     loop = asyncio.get_running_loop()
     try:
         async for packet in websocket:
             print(f"[WS -> TUN] Клиент получил пакет: {len(packet)} байт")
+            if not isinstance(packet, Buffer):
+                raise ValueError
             try:
                 await loop.run_in_executor(None, os.write, tun_fd, packet)
             except Exception as e:
@@ -44,44 +42,30 @@ async def ws_to_tun(websocket, tun_fd):
     except websockets.exceptions.ConnectionClosed:
         print("Соединение с сервером закрыто (ws_to_tun)")
 
-async def runcmd(cmd):
-    print(f"[bash] {cmd}")
-    process = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        print(f"[Ошибка] Команда '{cmd}' завершилась с кодом {process.returncode}")
-        print(f"[След ошибки]: {stderr.decode().strip()}")
-
-    return stdout.decode().strip()
-
 async def main():
     global ip, ts
     try:
-        tun_fd = create_tun(b"tun0")
-        print("TUN интерфейс 'tun0' успешно создан на клиенте.")
-        await runcmd("ip addr add 10.0.0.2/24 dev tun0")
-        await runcmd("ip link set up dev tun0")
-        await runcmd("ip link set dev tun0 mtu 1400")
-        print("Getting router")
-        ip = await runcmd("ip route show default | awk '{print $3}'")
-        print("Getting tailscale")
-        ts = await runcmd("getent hosts raspberrypi.taildfcdfd.ts.net | awk '{print $1}'")
-        await runcmd(f"sudo ip route add {ts} via {ip}")
-        await runcmd("sudo ip route del default")
-        await runcmd("sudo ip route add default dev tun0")
+        ip = await run_command("ip route show default | awk '{print $3}'")
+        ts = await run_command(f"getent hosts {urlparse(URI).netloc} | awk '{{print $1}}'")
+        tun_fd = create_tun(TUN.encode())
+        await run_command(f"ip addr add {TUN_IP} dev {TUN}")
+        await run_command(f"ip link set up dev {TUN}")
+        await run_command(f"ip link set dev {TUN} mtu 1400")
+        await run_command(f"sudo ip route add {ts} via {ip}")
+        await run_command(f"sudo ip route del default")
+        await run_command(f"sudo ip route add default dev {TUN}")
+        print(f"TUN интерфейс '{TUN}' успешно создан на клиенте.")
+    except PermissionError:
+        print("Запустите с sudo")
+        return
     except Exception as e:
-        print(f"Не удалось создать TUN (запустите через sudo): {e}")
+        print(f"Не удалось создать TUN: {e}")
         return
 
-    uri = "wss://raspberrypi.taildfcdfd.ts.net/cc"
-    print(f"Подключение к {uri}...")
+    print(f"Подключение к {URI}...")
 
     try:
-        async with websockets.connect(uri) as websocket:
+        async with websockets.connect(URI) as websocket:
             print("Соединение установлено! Туннель активен.")
             await asyncio.gather(
                 tun_to_ws(websocket=websocket, tun_fd=tun_fd),
@@ -91,15 +75,14 @@ async def main():
         print(f"Ошибка подключения или работы сокета: {e}")
 
 async def finish():
-    #ip = await runcmd("ip route show default | awk '{print $3}'")
-    #ts = await runcmd("getent hosts raspberrypi.taildfcdfd.ts.net | awk '{print $1}'")
-    await runcmd("sudo ip route del default")
-    await runcmd(f"sudo ip route add default via {ip} dev eth0")
-    await runcmd(f"sudo ip route del {ts}")
+    await run_command("sudo ip route del default")
+    await run_command(f"sudo ip route add default via {ip} dev {DEV}")
+    await run_command(f"sudo ip route del {ts}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nКлиент остановлен пользователем.")
+    finally:
         asyncio.run(finish())
